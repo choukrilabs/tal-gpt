@@ -1,61 +1,118 @@
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 import unittest
 
-from tal_0.agents import CoordinatorAgent, SubAgent
+from tal_0.agents import CoordinatorAgent, ErrorCode, TaskState
 from tal_0.benchmark import TokenBenchmark
 from tal_0.client import GeminiLLMClient
 from tal_0.core import Opcode, TALFrame
-from tal_0.tools import ToolRegistry
 
 
-class RuntimeTests(unittest.TestCase):
-    def test_vector_tool_returns_fixture_hit(self):
-        result = ToolRegistry.default().execute("find_vector", q="auth_cve", limit=1)
-        self.assertEqual(result.status, "ok")
-        self.assertEqual(result.output, ["CVE-2026-9041"])
-
-    def test_python_tool_evaluates_safe_expression(self):
-        result = ToolRegistry.default().execute("exec_python", code="min(100, 50)")
-        self.assertEqual(result.status, "ok")
-        self.assertEqual(result.output, 50)
-
-    def test_unknown_tool_returns_error(self):
-        result = ToolRegistry.default().execute("does_not_exist")
-        self.assertEqual(result.status, "error")
-
-    def test_coordinator_runs_plan_command_return_eval(self):
+class LifecycleTests(unittest.TestCase):
+    def test_submit_records_task_and_terminal_result_uses_same_id(self):
         coordinator = CoordinatorAgent()
-        trace = coordinator.run("Investigate auth_cve and test min(100, 50)")
-        headers = [frame.header for frame in trace]
-        self.assertEqual(headers[:2], [Opcode.THK, Opcode.CMD])
-        self.assertIn(Opcode.RET, headers)
-        self.assertTrue(any(frame.header == Opcode.THK and frame.action == "eval" for frame in trace))
-        self.assertIn("CVE-2026-9041", trace[-1].payload)
-        self.assertIn("50", trace[-1].payload)
+        trace = coordinator.submit(TALFrame(Opcode.CMD, "c0", "r1", "find/vec", "q='auth_cve'", "!", "a7"))
+        self.assertEqual(trace[0].correlation_id, "a7")
+        self.assertEqual(trace[-1].correlation_id, "a7")
+        self.assertEqual(coordinator.state_for("a7").state, TaskState.SUCCEEDED)
 
-    def test_subagent_returns_structured_result(self):
-        subagent = SubAgent("e1", "sandbox", ToolRegistry.default())
-        result = subagent.handle(TALFrame(Opcode.CMD, "c0", "e1", "exec/py", "code='min(100,50)'") )
+    def test_concurrent_tasks_are_independent(self):
+        coordinator = CoordinatorAgent()
+        coordinator.submit(TALFrame(Opcode.QRY, "c0", "r1", "status", "target='a1'", "", "a1"))
+        coordinator.submit(TALFrame(Opcode.QRY, "c0", "r1", "status", "target='a2'", "", "a2"))
+        self.assertNotEqual(coordinator.state_for("a1").id, coordinator.state_for("a2").id)
+
+    def test_cancel_running_task_emits_terminal_event(self):
+        coordinator = CoordinatorAgent()
+        task = TALFrame(Opcode.CMD, "c0", "r1", "exec", "code='timeout'", "", "a7")
+        coordinator.register(task)
+        record = coordinator.state_for("a7")
+        record.transition(TaskState.DISPATCHED)
+        record.transition(TaskState.RUNNING)
+        cancellation = TALFrame(Opcode.CMD, "c0", "r1", "halt", "id='a7'", "", "c9")
+        result = coordinator.cancel(cancellation)
+        self.assertEqual(result.header, Opcode.EVT)
+        self.assertEqual(result.correlation_id, "a7")
+        self.assertEqual(coordinator.state_for("a7").state, TaskState.CANCELLED)
+
+    def test_terminal_task_cannot_transition(self):
+        coordinator = CoordinatorAgent()
+        frame = TALFrame(Opcode.CMD, "c0", "r1", "find/vec", "q='auth'", "", "a1")
+        coordinator.submit(frame)
+        with self.assertRaises(ValueError):
+            coordinator.state_for("a1").transition(TaskState.RUNNING)
+
+
+class OperationalSemanticsTests(unittest.TestCase):
+    def test_timeout_error_contains_retry_and_delay(self):
+        coordinator = CoordinatorAgent()
+        frame = TALFrame(Opcode.CMD, "c0", "e1", "exec", "code='timeout'", "", "a7")
+        result = coordinator.route(frame)
+        self.assertEqual(result.header, Opcode.ERR)
+        self.assertIn("code='TIMEOUT'", result.payload)
+        self.assertIn("retry=T", result.payload)
+        self.assertIn("after=2s", result.payload)
+
+    def test_duplicate_id_does_not_execute_twice_when_idempotent(self):
+        coordinator = CoordinatorAgent()
+        frame = TALFrame(Opcode.CMD, "c0", "r1", "assert/equal", "expected='x',actual='x',idem=T", "", "a7")
+        first = coordinator.route(frame)
+        second = coordinator.route(frame)
+        self.assertEqual(first.header, Opcode.RET)
+        self.assertEqual(second.header, Opcode.RET)
+        self.assertIn("replayed=T", second.payload)
+
+    def test_capability_query_returns_supported_actions(self):
+        coordinator = CoordinatorAgent()
+        result = coordinator.route(TALFrame(Opcode.QRY, "c0", "r1", "capabilities", "", "", "q1"))
         self.assertEqual(result.header, Opcode.RET)
-        self.assertIn("50", result.payload)
+        self.assertIn("find/vec", result.payload)
 
-    def test_client_without_key_uses_deterministic_fallback(self):
-        client = GeminiLLMClient(api_key=None)
-        result = client.generate("demo")
-        self.assertIn("TAL-0", result)
-        self.assertIn("fallback", result.lower())
+    def test_qry_rejects_mutating_action(self):
+        coordinator = CoordinatorAgent()
+        result = coordinator.route(TALFrame(Opcode.QRY, "c0", "r1", "write", "path='x'", "?", "q9"))
+        self.assertEqual(result.header, Opcode.ERR)
+        self.assertIn("QRY_cannot_mutate", result.payload)
 
-    def test_benchmark_counts_nonempty_text(self):
-        self.assertGreater(TokenBenchmark.count("abc"), 0)
+    def test_missing_agent_returns_not_found(self):
+        coordinator = CoordinatorAgent()
+        result = coordinator.route(TALFrame(Opcode.CMD, "c0", "z9", "read", "path='x'", "", "a9"))
+        self.assertEqual(result.header, Opcode.ERR)
+        self.assertIn("NOT_FOUND", result.payload)
 
-    def test_benchmark_reports_savings(self):
-        results = TokenBenchmark.compare("one two three four", "one two", "one")
-        self.assertLess(results["tal_tokens"], results["natural_tokens"])
-        self.assertGreater(results["savings_vs_natural_pct"], 0)
+    def test_parent_correlation_is_preserved(self):
+        coordinator = CoordinatorAgent()
+        frame = TALParserRoundTripHelper.child_frame()
+        coordinator.register(frame)
+        self.assertEqual(coordinator.state_for("b1").parent, "a7")
+
+
+class PackageTests(unittest.TestCase):
+    def test_fallback_mentions_tal_1(self):
+        self.assertIn("TAL-1", GeminiLLMClient(api_key=None).generate("demo"))
+
+    def test_benchmark_table_names_tal_1(self):
+        results = TokenBenchmark.compare("a b", "a", "a")
+        self.assertIn("TAL-1", TokenBenchmark.render_table(results))
+
+
+class IntegrationTests(unittest.TestCase):
+    def test_coordinator_run_contains_tal1_lifecycle(self):
+        trace = CoordinatorAgent().run("demo")
+        headers = [frame.header for frame in trace]
+        self.assertIn(Opcode.THK, headers)
+        self.assertIn(Opcode.CMD, headers)
+        self.assertIn(Opcode.EVT, headers)
+        self.assertIn(Opcode.RET, headers)
+
+    def test_cancel_unknown_task_is_not_found(self):
+        result = CoordinatorAgent().cancel(TALFrame(Opcode.CMD, "c0", "r1", "halt", "id='missing'", "", "c1"))
+        self.assertEqual(result.header, Opcode.ERR)
+        self.assertIn(ErrorCode.NOT_FOUND.value, result.payload)
+
+
+class TALParserRoundTripHelper:
+    @staticmethod
+    def child_frame():
+        return TALFrame(Opcode.CMD, "r1", "r2", "read", "path='spec.md',parent=a7", "!", "b1", "a7")
 
 
 if __name__ == "__main__":

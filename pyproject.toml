@@ -3,9 +3,9 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tal-0"
-version = "1.0.0"
-description = "Ultra-dense multi-agent orchestration protocol and token-efficient reasoning engine."
+name = "tal-gpt"
+version = "1.1.0"
+description = "Compact TAL-1 multi-agent coordination protocol and token-efficient orchestration runtime."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

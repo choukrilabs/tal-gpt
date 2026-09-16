@@ -1,12 +1,13 @@
-"""TAL-0: Token-Action Language Zero."""
+"""TAL-GPT reference implementation for TAL-1.0."""
 
-from .core import Opcode, TALFrame, TALParseError, TALParser
+from .agents import CoordinatorAgent, ErrorCode, SubAgent, TaskRecord, TaskState
+from .benchmark import BenchmarkResult, TokenBenchmark
+from .client import GeminiLLMClient
+from .core import Opcode, TALFrame, TALParseError, TALParser, escape, unescape
 from .tools import ToolRegistry, ToolResult
-from .agents import CoordinatorAgent, SubAgent
-from .client import GeminiLLMClient, GeminiClientError
-from .benchmark import TokenBenchmark
 
 __all__ = [
-    "Opcode", "TALFrame", "TALParseError", "TALParser", "ToolRegistry", "ToolResult",
-    "CoordinatorAgent", "SubAgent", "GeminiLLMClient", "GeminiClientError", "TokenBenchmark",
+    "Opcode", "TALFrame", "TALParseError", "TALParser", "escape", "unescape",
+    "CoordinatorAgent", "SubAgent", "TaskRecord", "TaskState", "ErrorCode",
+    "ToolRegistry", "ToolResult", "GeminiLLMClient", "BenchmarkResult", "TokenBenchmark",
 ]

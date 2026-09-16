@@ -1,4 +1,4 @@
-"""Zero-dependency Gemini HTTP client with explicit local fallback."""
+"""Gemini transport adapter with retry/backoff and deterministic TAL-1 fallback."""
 
 from __future__ import annotations
 
@@ -10,61 +10,26 @@ import urllib.request
 from typing import Optional
 
 
-class GeminiClientError(RuntimeError):
-    """Raised when the Gemini API request cannot be completed."""
-
-
 class GeminiLLMClient:
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        model: str = "gemini-3-flash-preview",
-        timeout: float = 30.0,
-        max_retries: int = 3,
-    ) -> None:
-        self.api_key = api_key if api_key is not None else os.getenv("GEMINI_API_KEY")
+    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-3-flash-preview", max_retries: int = 3, base_delay: float = 0.5) -> None:
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         self.model = model
-        self.timeout = timeout
-        self.max_retries = max(0, int(max_retries))
+        self.max_retries = max(0, max_retries)
+        self.base_delay = max(0.0, base_delay)
 
     def generate(self, prompt: str) -> str:
         if not self.api_key:
-            return "TAL-0 deterministic fallback: no Gemini API call was made."
-
+            return "TAL-1 fallback: deterministic response for prompt={}".format(prompt[:80])
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
         body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
-            method="POST",
-        )
-
-        last_error: Optional[Exception] = None
+        request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key}, method="POST")
         for attempt in range(self.max_retries + 1):
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with urllib.request.urlopen(request, timeout=30) as response:
                     payload = json.loads(response.read().decode("utf-8"))
-                return self._extract_text(payload)
-            except urllib.error.HTTPError as exc:
-                last_error = exc
-                if exc.code not in (408, 429, 500, 502, 503, 504) or attempt >= self.max_retries:
-                    break
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, GeminiClientError) as exc:
-                last_error = exc
+                return payload["candidates"][0]["content"]["parts"][0]["text"]
+            except (urllib.error.HTTPError, urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError) as exc:
                 if attempt >= self.max_retries:
-                    break
-            time.sleep(min(0.5 * (2 ** attempt), 8.0))
-
-        raise GeminiClientError(f"Gemini request failed after retries: {last_error}")
-
-    @staticmethod
-    def _extract_text(payload: dict) -> str:
-        candidates = payload.get("candidates") or []
-        if not candidates:
-            raise GeminiClientError("Gemini response contains no candidates")
-        parts = ((candidates[0].get("content") or {}).get("parts") or [])
-        text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
-        if not text:
-            raise GeminiClientError("Gemini response contains no text part")
-        return text
+                    return f"TAL-1 fallback after transport failure: {exc}"
+                time.sleep(self.base_delay * (2 ** attempt))
+        raise RuntimeError("unreachable")

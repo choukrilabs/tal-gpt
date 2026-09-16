@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility wrapper for the TAL-0 package CLI."""
-
-from pathlib import Path
-import sys
-
-ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+"""Repository-level TAL-GPT runtime entry point."""
 
 from tal_0.cli import main
 
